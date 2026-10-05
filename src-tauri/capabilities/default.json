@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "windows": ["main"],
+  "permissions": [
+    "core:default", "dialog:default",
+    "fs:allow-read-file", "fs:allow-write-file",
+    { "identifier": "fs:scope", "allow": [{ "path": "**" }] }
+  ]
+}
