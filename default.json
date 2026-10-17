@@ -1,12 +1,12 @@
 {
   "identifier": "default",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
-    "core:default", "dialog:default",
-    "fs:allow-read-file", "fs:allow-write-file",
-    {
-      "identifier": "http:default",
-      "allow": [{ "url": "https://*" }, { "url": "https://*:*" }, { "url": "http://localhost:*" }, { "url": "http://127.0.0.1:*" }]
-    }
+    "core:default",
+    "dialog:default",
+    "fs:allow-read-file",
+    "fs:allow-write-file"
   ]
 }

@@ -21,6 +21,49 @@ fn set_overrides(map: HashMap<String, String>) {
     if let Ok(mut g) = OVR.get_or_init(|| Mutex::new(HashMap::new())).lock() { *g = map; }
 }
 
+// All AI / web calls go through Rust: no streaming layer, so an empty or odd body can never crash the page.
+#[tauri::command]
+async fn http_request(url: String, method: String, headers: HashMap<String, String>, body: String) -> Result<Value, String> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(180)).build().map_err(|e| e.to_string())?;
+    let m = reqwest::Method::from_bytes(method.to_uppercase().as_bytes()).map_err(|e| e.to_string())?;
+    let mut rb = client.request(m, &url);
+    for (k, v) in headers { rb = rb.header(k, v); }
+    if !body.is_empty() { rb = rb.body(body); }
+    let r = rb.send().await.map_err(|e| format!("network error: {e}"))?;
+    let status = r.status().as_u16();
+    let text = r.text().await.map_err(|e| format!("could not read the answer: {e}"))?;
+    Ok(json!({ "status": status, "body": text }))
+}
+
+// ---- projects (one folder per project: project.json + meta.json + media/) ----
+fn projects_root() -> PathBuf { local_app().join("projects") }
+
+#[tauri::command]
+fn projects_dir() -> String {
+    let d = projects_root();
+    let _ = std::fs::create_dir_all(&d);
+    d.display().to_string()
+}
+
+#[tauri::command]
+fn list_projects() -> Vec<Value> {
+    let mut v = vec![];
+    if let Ok(rd) = std::fs::read_dir(projects_root()) {
+        for e in rd.flatten() {
+            if let Ok(t) = std::fs::read_to_string(e.path().join("meta.json")) {
+                if let Ok(j) = serde_json::from_str::<Value>(&t) { v.push(j); }
+            }
+        }
+    }
+    v
+}
+
+#[tauri::command]
+fn delete_project(id: String) -> Result<(), String> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') { return Err("bad project id".into()); }
+    std::fs::remove_dir_all(projects_root().join(id)).map_err(|e| e.to_string())
+}
+
 fn local_app() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("InstaClipStudio")
 }
@@ -102,6 +145,11 @@ fn find_tool(name: &str) -> Option<PathBuf> {
     if let Some(p) = which(name) { return Some(p); }
     if name == "ffmpeg" { return imageio_ffmpeg(); }
     None
+}
+
+fn cohere_python() -> Option<PathBuf> {
+    let p = local_app().join("cohere-venv").join("Scripts").join("python.exe");
+    if p.is_file() { Some(p) } else { None }
 }
 
 fn find_whisper_cli() -> Option<PathBuf> {
@@ -272,7 +320,21 @@ async fn env_check() -> Result<String, String> {
             if s.contains("imageio_ffmpeg") { "found with moviepy" } else if s.starts_with(&tools_dir().display().to_string()) { "installed by this app" } else { "system" }
         });
         let wc = find_whisper_cli();
+        let hub = hf_hub();
+        let mut cm: Vec<&str> = vec![];
+        if hub.join("models--CohereLabs--cohere-transcribe-03-2026").is_dir() { cm.push("general"); }
+        if hub.join("models--CohereLabs--cohere-transcribe-arabic-07-2026").is_dir() { cm.push("arabic"); }
+        let mut cver = String::new();
+        if let Some(p) = cohere_python() {
+            let mut c = Command::new(p);
+            nowin(&mut c);
+            if let Ok(o) = c.args(["-c", "import transformers;print(transformers.__version__)"]).output() {
+                if o.status.success() { cver = String::from_utf8_lossy(&o.stdout).trim().to_string(); }
+            }
+        }
+        let ok_rt = { let mut it = cver.split('.').filter_map(|x| x.parse::<u32>().ok()); match (it.next(), it.next()) { (Some(a), Some(b)) => a > 5 || (a == 5 && b >= 4), _ => false } };
         Ok(json!({
+            "cohere": { "runtime": ok_rt, "version": cver, "models": cm, "token": ovr("hf_token").is_some() },
             "python": { "ok": py.is_some(), "version": pyver },
             "pkgs": pkgs,
             "yt_dlp": { "ok": yt.is_some() || pkgs["yt_dlp"] == true, "path": yt.map(|p| p.display().to_string()), "module": pkgs["yt_dlp"] == true },
@@ -331,6 +393,29 @@ async fn install_tool(app: AppHandle, name: String) -> Result<String, String> {
                 c.args(["install", "-e", "--id", "Python.Python.3.12", "--accept-package-agreements", "--accept-source-agreements"]);
                 if !run_stream(&app, "setup-log", c)?.success() { return Err("winget could not install Python".into()); }
                 log("Python installed — restart the app so it is picked up.");
+            }
+            "cohere" => {
+                let venv = local_app().join("cohere-venv");
+                let mut c = pycmd().ok_or("Python not found")?;
+                c.args(["-m", "venv", "--system-site-packages"]).arg(&venv);
+                if !run_stream(&app, "setup-log", c)?.success() { return Err("could not create the Cohere Python environment".into()); }
+                let vp = venv.join("Scripts").join("python.exe");
+                let mut pk: Vec<&str> = vec!["transformers>=5.4.0", "accelerate", "soundfile", "librosa", "sentencepiece", "protobuf", "huggingface_hub"];
+                if !py_has("torch") { pk.push("torch"); }
+                let mut c = Command::new(&vp);
+                nowin(&mut c);
+                c.args(["-m", "pip", "install", "--upgrade", "--progress-bar", "off"]).args(&pk);
+                if !run_stream(&app, "setup-log", c)?.success() { return Err("pip install for the Cohere runtime failed".into()); }
+            }
+            n if n.starts_with("cohere_model:") => {
+                let id = &n[13..];
+                if id != "CohereLabs/cohere-transcribe-03-2026" && id != "CohereLabs/cohere-transcribe-arabic-07-2026" { return Err("unknown model".into()); }
+                let vp = cohere_python().ok_or("Install the Cohere runtime first")?;
+                let tok = ovr("hf_token").ok_or("Add your Hugging Face token first (the Cohere models are gated)")?;
+                let mut c = Command::new(vp);
+                nowin(&mut c);
+                c.args(["-c", &format!("from huggingface_hub import snapshot_download; print(snapshot_download('{id}'))")]).env("HF_TOKEN", tok);
+                if !run_stream(&app, "setup-log", c)?.success() { return Err("model download failed — accept the model's terms on huggingface.co and check your token".into()); }
             }
             n if n.starts_with("fwmodel:") => {
                 let m = &n[8..];
@@ -441,6 +526,29 @@ async fn transcribe(app: AppHandle, input: String, lang: String, maxlen: u32, tr
         if !o.status.success() {
             return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("")));
         }
+        if engine == "cohere" {
+            let mid = match lang.as_str() {
+                "ar" => "CohereLabs/cohere-transcribe-arabic-07-2026",
+                "en" => "CohereLabs/cohere-transcribe-03-2026",
+                _ => return Err("Cohere Transcribe supports English and Arabic only (it has no Urdu). Pick a Whisper engine for this language.".into()),
+            };
+            let vpy = cohere_python().ok_or("Cohere runtime is not installed - open Setup and install it")?;
+            let tok = ovr("hf_token").ok_or("Add your Hugging Face token in Setup (the Cohere models are gated)")?;
+            let script = tmp.join("ics_cohere.py");
+            let argf = tmp.join("ics_cohere_args.json");
+            let outj = tmp.join("ics_cohere.json");
+            let _ = std::fs::remove_file(&outj);
+            std::fs::write(&script, include_str!("../cohere_run.py")).map_err(|e| e.to_string())?;
+            std::fs::write(&argf, json!({"audio": wav.display().to_string(), "out": outj.display().to_string(), "model_id": mid, "lang": lang}).to_string()).map_err(|e| e.to_string())?;
+            let mut c = Command::new(vpy);
+            nowin(&mut c);
+            c.arg(&script).arg(&argf).env("HF_TOKEN", tok).env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1").env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1");
+            let st = run_stream(&app, "whisper-log", c)?;
+            let _ = std::fs::remove_file(&wav);
+            if !st.success() { return Err(format!("Cohere Transcribe failed ({st}) - see the log; check your token and that you accepted the model terms")); }
+            let segs: Value = serde_json::from_str(&std::fs::read_to_string(&outj).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            return Ok(json!({ "segments": segs, "engine": "cohere" }).to_string());
+        }
         let use_faster = match engine.as_str() { "faster" => true, "cpp" => false, _ => model != "large-v3-turbo-q5_0" && py_has("faster_whisper") };
         if use_faster {
             let script = tmp.join("ics_whisper.py");
@@ -482,7 +590,7 @@ async fn transcribe(app: AppHandle, input: String, lang: String, maxlen: u32, tr
 
 // ---------------------------------------------------------------- final render: audio chain + MP4 encode
 #[tauri::command]
-async fn finalize_export(app: AppHandle, video: String, source: String, start: f64, dur: f64, speed: f64, enhance: bool, pre: String, vocals: bool, demucs: String, crf: u32, out: String) -> Result<String, String> {
+async fn finalize_export(app: AppHandle, video: String, source: String, start: f64, dur: f64, speed: f64, enhance: bool, pre: String, vocals: bool, demucs: String, crf: u32, out: String, aclips: String, vol: f64) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let log = |m: &str| { let _ = app.emit("export-log", m.to_string()); };
         let work = PathBuf::from(&out).parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir);
@@ -490,7 +598,7 @@ async fn finalize_export(app: AppHandle, video: String, source: String, start: f
         let speed = if speed.is_finite() && speed >= 0.5 && speed <= 2.0 { speed } else { 1.0 };
         let mut src = if pre.trim().is_empty() { source.clone() } else { pre.clone() };
         let mut trimmed = false;
-        if vocals && pre.trim().is_empty() {
+        if vocals && pre.trim().is_empty() && !source.trim().is_empty() {
             log("Extracting audio for vocal isolation…");
             let hq = work.join("audio_hq.wav");
             let o = ffmpeg()?.args(["-y", "-ss", &start.to_string(), "-t", &dur.to_string(), "-i", &source, "-vn", "-ac", "2", "-ar", "44100"]).arg(&hq).output().map_err(|e| format!("ffmpeg: {e}"))?;
@@ -518,11 +626,39 @@ async fn finalize_export(app: AppHandle, video: String, source: String, start: f
             chain.push("acompressor=threshold=0.125:ratio=3:attack=10:release=150:makeup=2,loudnorm=I=-16:TP=-1.5:LRA=11".into());
         }
         let af = chain.join(",");
+        let clips: Vec<Value> = serde_json::from_str(&aclips).unwrap_or_default();
         let mut c = ffmpeg()?;
         c.arg("-y");
-        if !trimmed { c.args(["-ss", &start.to_string(), "-t", &dur.to_string()]); }
-        c.arg("-i").arg(&src).args(["-vn", "-ac", "2", "-ar", "44100"]);
-        if !af.is_empty() { c.args(["-af", &af]); }
+        if src.trim().is_empty() {
+            // no main audio in the project: start from silence so extra clips can be mixed on top
+            c.args(["-f", "lavfi", "-t", &dur.to_string(), "-i", "anullsrc=r=44100:cl=stereo"]);
+        } else {
+            if !trimmed { c.args(["-ss", &start.to_string(), "-t", &dur.to_string()]); }
+            c.arg("-i").arg(&src);
+        }
+        if clips.is_empty() {
+            c.args(["-vn", "-ac", "2", "-ar", "44100"]);
+            if !af.is_empty() { c.args(["-af", &af]); }
+        } else {
+            // main audio + every extra audio / video clip, mixed on the timeline (two or more play together)
+            let mut g = format!("[0:a]volume={vol}[a0];");
+            let mut labels = String::from("[a0]");
+            for (i, cl) in clips.iter().enumerate() {
+                let k = i + 1;
+                c.arg("-i").arg(cl["path"].as_str().unwrap_or(""));
+                let off = cl["off"].as_f64().unwrap_or(0.0);
+                let len = cl["len"].as_f64().unwrap_or(1.0);
+                let delay = (cl["delay"].as_f64().unwrap_or(0.0) * 1000.0).round() as i64;
+                let v = cl["vol"].as_f64().unwrap_or(1.0);
+                let lp = if cl["loop"].as_bool().unwrap_or(false) { "aloop=loop=-1:size=2147483647," } else { "" };
+                g.push_str(&format!("[{k}:a]{lp}atrim=start={off}:end={},asetpts=PTS-STARTPTS,volume={v},adelay={delay}|{delay}[a{k}];", off + len));
+                labels.push_str(&format!("[a{k}]"));
+            }
+            let n = clips.len() + 1;
+            let tail = if af.is_empty() { "anull".to_string() } else { af.clone() };
+            g.push_str(&format!("{labels}amix=inputs={n}:duration=longest:dropout_transition=0,volume={n},{tail}[aout]"));
+            c.args(["-filter_complex", &g, "-map", "[aout]", "-ac", "2", "-ar", "44100"]);
+        }
         let o = c.arg(&wav).output().map_err(|e| format!("ffmpeg: {e}"))?;
         if !o.status.success() { return Err(format!("audio step failed: {}", String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or(""))); }
         for (enc, extra) in [("h264_nvenc", vec!["-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "19", "-b:v", "8500k"]), ("libx264", vec!["-preset", "medium"])] {
@@ -544,9 +680,8 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_http::init())
         .invoke_handler(tauri::generate_handler![
-            set_overrides, env_check, install_tool, read_file, write_file, reveal,
+            set_overrides, env_check, http_request, projects_dir, list_projects, delete_project, install_tool, read_file, write_file, reveal,
             ytdlp_version, ytdlp_update, ytdlp_download, transcribe, finalize_export
         ])
         .run(tauri::generate_context!())

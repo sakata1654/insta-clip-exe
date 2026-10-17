@@ -13,5 +13,7 @@ try {
 try {
   $f = Join-Path $root 'src\fonts'; New-Item -ItemType Directory -Force $f | Out-Null
   Invoke-WebRequest 'https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Bold.ttf' -OutFile "$f\Amiri-Bold.ttf"
+  Invoke-WebRequest 'https://raw.githubusercontent.com/google/fonts/main/ofl/amiriquran/AmiriQuran-Regular.ttf' -OutFile "$f\AmiriQuran-Regular.ttf"
+  Invoke-WebRequest 'https://raw.githubusercontent.com/google/fonts/main/ofl/scheherazadenew/ScheherazadeNew-Regular.ttf' -OutFile "$f\ScheherazadeNew-Regular.ttf"
 } catch { Write-Warning "font download failed: $_" }
 Write-Host 'Build assets ready.'
